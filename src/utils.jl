@@ -84,7 +84,7 @@ Build a step function compatible with `gen` that calls the design model.
 - `frameid`: single-element vector holding a mutable frame counter used in
   file naming; typically left at the default.
 """
-function step_spec(model, pdb_id, chain_labels, feature_func; recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing)
+function step_spec(model::BranchChainV2, pdb_id, chain_labels, feature_func; recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing)
     sc_frames = nothing
     function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)
         !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", Xₜ.state, Xₜ.groupings, collect(1:length(Xₜ.groupings)))
@@ -100,6 +100,36 @@ function step_spec(model, pdb_id, chain_labels, feature_func; recycles = 0, vidp
         end
         resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
         input_bundle = ([t]', Xₜ, Xₜ.groupings, resinds, [true], chain_features) |> device
+        for _ in 1:recycles
+            sc_frames, _ = model(input_bundle..., sc_frames = gpu(sc_frames))
+        end
+        pred = model(input_bundle..., sc_frames = gpu(sc_frames)) |> cpu
+        sc_frames = deepcopy(pred[1])
+        state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(cpu(values(linear(pred[1]))), dims=(3,4))), pred[2], nothing
+        !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", (state_pred[1], state_pred[2], Xₜ.state[3]), Xₜ.groupings, collect(1:length(Xₜ.groupings)))
+        frameid[1] += 1
+        Xtstate[4].S.state .= 1:length(Xtstate[4].S.state) #<-Update the indexing state
+        return state_pred, pred[3], pred[4]
+    end
+    return mod_wrapper
+end
+
+#Need to think about how to handle both conditional and unconditional models more gracefully than a code-duplicated dispatch.
+function step_spec(model::BranchChainV1, pdb_id, chain_labels, feature_func; recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing)
+    sc_frames = nothing
+    function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)
+        !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", Xₜ.state, Xₜ.groupings, collect(1:length(Xₜ.groupings)))
+        Xtstate = Xₜ.state
+        frominds = Xtstate[4].S.state[:]
+        if !isnothing(sc_frames)
+            sc_frames = Translation(sc_frames.composed.outer.values[:,:,frominds,:]) ∘ Rotation(sc_frames.composed.inner.values[:,:,frominds,:])
+        end
+        printseq && println(replace(DLProteinFormats.ints_to_aa(tensor(Xtstate[3])[:]), "X"=>"-"), ":", frameid[1])
+        if length(tensor(Xtstate[3])[:]) > 2000
+            error("Chain too long")
+        end
+        resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
+        input_bundle = ([t]', Xₜ, Xₜ.groupings, resinds, [true]) |> device
         for _ in 1:recycles
             sc_frames, _ = model(input_bundle..., sc_frames = gpu(sc_frames))
         end
@@ -251,6 +281,8 @@ function design(model, X1, pdb_id, chain_labels, feature_func; steps = step_sche
     !isnothing(path) && export_pdb(path, samp.state, samp.groupings, collect(1:length(samp.groupings)))
     return samp
 end
+
+design(model, X1; kwargs...) = design(model, X1, "", [""], (x...; kwargs...) -> Dict(); kwargs...)
 
 """
     gen2prot(samp, chainids, resnums; name="Gen")

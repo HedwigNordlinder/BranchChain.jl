@@ -29,8 +29,8 @@ dat = load(PDBSimpleFlatV2);
 feature_table = load(PDBTable);
 pdb_clusters = load(PDBClusters);
 
-train_ff = featurizer(feature_table, DLProteinFormats.CHAIN_FEATS_V1)
-sampling_ff = featurizer(feature_table, DLProteinFormats.CHAIN_FEATS_V1)
+train_ff = featurizer(feature_table, CHAIN_FEATS_V1)
+sampling_ff = featurizer(feature_table, CHAIN_FEATS_V1)
 clusters = [pdb_clusters[c] for c in pdbid_clean.(dat.name)]
 
 #To prevent OOM, we now need to factor in that some low-t samples might have more elements than their X1 lengths:

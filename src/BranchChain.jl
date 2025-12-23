@@ -10,5 +10,6 @@ using DLProteinFormats: load, PDBSimpleFlat, batch_flatrecs, sample_batched_inds
 include("models.jl")
 include("design_mask.jl")
 include("utils.jl")
+include("sym.jl")
 
 end

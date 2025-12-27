@@ -7,9 +7,6 @@
 
 ## Demo
 
-> [!NOTE]
-> BranchChain presently requires Julia 1.11.
-
 Set up BranchChain with CUDA in a temporary environment and load the model:
 
 ```julia

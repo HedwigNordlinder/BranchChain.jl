@@ -277,14 +277,14 @@ Returns the final sampled branching state `samp`.
 """
 #Needs to consider features/feature modifications.
 #This should be generalized to also be allowed to take in features directly. Or something.
-function design(model, X1, pdb_id, chain_labels, feature_func; steps = step_sched.(0f0:0.005:1f0), transform_array = [],
+function design(model, X1, pdb_id, chain_labels, feature_func; transform_array = [], t0 = 0f0, steps = step_sched.(t0:0.005:1f0),
                 path = nothing, vidpath = nothing, printseq = true, device = identity, feature_override = nothing, hook = nothing,
                 P = P, X0_mean_length = model.layers.config.X0_mean_length_minus_1, deletion_pad = model.layers.config.deletion_pad, recycles = 0)
     if steps isa Number
-        steps = step_sched.(0f0:Float32(1/steps):1f0)
+        steps = step_sched.(t0:Float32((1-t0)/steps):1f0)
     end
     hasnobreaks = [true]
-    t = [0f0]
+    t = [Float32(t0)]
     bat = branching_bridge(P, X0sampler, [X1], t, 
                             coalescence_factor = 1.0, 
                             use_branching_time_prob = 0.0,

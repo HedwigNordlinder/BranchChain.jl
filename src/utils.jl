@@ -65,7 +65,7 @@ function training_prep(b, dat, deletion_pad, X0_mean_length, feature_func; P = P
     return (;t = bat.t, chainids = bat.Xt.groupings, resinds,
                     Xt = bat.Xt, hasnobreaks = hasnobreaks,
                     rotξ_target = rotξ, X1_locs_target = bat.X1anchor[1], X1aas_target = bat.X1anchor[3],
-                    splits_target = bat.splits_target, del = bat.del, chain_features)
+                    splits_target = bat.splits_target, del = bat.del, chain_features, X1atom14_target = bat.X1anchor[4])
 end
 
 """
@@ -113,6 +113,38 @@ function step_spec(model::Union{BranchChainV2,BranchChainV3}, pdb_id, chain_labe
         frameid[1] += 1
         Xtstate[4].S.state .= 1:length(Xtstate[4].S.state) #<-Update the indexing state? Not being used.
         return state_pred, pred[3], pred[4]
+    end
+    return mod_wrapper
+end
+
+function step_spec(model::BranchChainAA1, pdb_id, chain_labels, feature_func; hook = nothing,
+    recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing, transform_array = [])
+    sc_frames = nothing
+    function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)
+        !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", Xₜ.state, Xₜ.groupings, collect(1:length(Xₜ.groupings)))
+        Xtstate = Xₜ.state
+        frominds = Xtstate[5].S.state[:]
+        chain_features = broadcast_features([pdb_id], [chain_labels], Xₜ.groupings, (a,b) -> feature_func(a,b,override = feature_override))
+        if !isnothing(sc_frames)
+            sc_frames = Translation(sc_frames.composed.outer.values[:,:,frominds,:]) ∘ Rotation(sc_frames.composed.inner.values[:,:,frominds,:])
+        end
+        printseq && println(replace(DLProteinFormats.ints_to_aa(tensor(Xtstate[3])[:]), "X"=>"-"), ":", frameid[1])
+        if length(tensor(Xtstate[3])[:]) > 2000
+            error("Chain too long")
+        end
+        resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
+        input_bundle = ([t]', Xₜ, Xₜ.groupings, resinds, [true], chain_features) |> device
+        for _ in 1:recycles
+            sc_frames, _ = model(input_bundle..., sc_frames = device(sc_frames))
+        end
+        pred = model(input_bundle..., sc_frames = device(sc_frames)) |> cpu
+        sc_frames = deepcopy(pred[1])
+        state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(values(linear(pred[1])), dims=(3,4))), pred[2], ContinuousState(pred[3]), nothing
+        !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", (state_pred[1], state_pred[2], Xₜ.state[3], state_pred[4]), Xₜ.groupings, collect(1:length(Xₜ.groupings)))
+        !isnothing(hook) && hook(Xₜ.groupings, Xₜ.state, state_pred)
+        frameid[1] += 1
+        Xtstate[5].S.state .= 1:length(Xtstate[5].S.state) #<-Update the indexing state? Not being used.
+        return state_pred, pred[4], pred[5]
     end
     return mod_wrapper
 end
@@ -175,7 +207,7 @@ Sample a random masked target `X1` from the dataset to use as a template.
 """
 #NEEDS TO PASS THROUGH PDB AND CHAIN IDS
 function random_template(dat; only_sampled_masked = true)
-    b = rand(findall(dat.len .< 1000))
+    b = rand(findall(length.(dat.AAs) .< 1000))
     sampled = compoundstate.(dat[[b]])
     X1s = [s[1] for s in sampled]
     if only_sampled_masked
@@ -183,7 +215,7 @@ function random_template(dat; only_sampled_masked = true)
         while length(X1s[1].flowmask) == sum(X1s[1].flowmask)
             println("Resampling because there are no masked chains")
             counter += 1
-            b = rand(findall(dat.len .< 1000))
+            b = rand(findall(length.(dat.AAs) .< 1000))
             sampled = compoundstate.(dat[[b]])
             X1s = [s[1] for s in sampled]
             if counter > 100
@@ -210,8 +242,9 @@ sequence segments.
 #Needs to handle/return features:
 function X1_from_pdb(pdb_rec, segments_to_mask::Vector{String}; exclude_flatchain_nums = Int[], recenter = false)
     pdb_rec.cluster = 1
-    rec = DLProteinFormats.flatten(pdb_rec)
+    rec = DLProteinFormats.flatten(Atom14(), pdb_rec)
     L = length(rec.AAs)
+    locs = reshape(rec.locs, 3, 1, L)
     #new bit
     flatAA_chars = collect(join(DLProteinFormats.AAs[rec.AAs]))
     for ex in exclude_flatchain_nums
@@ -236,8 +269,9 @@ function X1_from_pdb(pdb_rec, segments_to_mask::Vector{String}; exclude_flatchai
     end
     X1rots = MaskedState(ManifoldState(rotM,eachslice(rec.rots, dims=3)), cmask, cmask)
     X1aas = MaskedState((DiscreteState(21, rec.AAs)), cmask, cmask)
+    X1atom14 = MaskedState(ContinuousState(local_atom14(rec.locs, rec.rots, rec.atom14_coords)[:,4:14,:]), cmask, cmask)
     index_state = MaskedState((DiscreteState(0, [1:L;])), cmask, cmask)
-    X1 = BranchingState((X1locs, X1rots, X1aas, index_state), rec.chainids, flowmask = cmask, branchmask = cmask) #<- .state, .groupings
+    X1 = BranchingState((X1locs, X1rots, X1aas, X1atom14, index_state), rec.chainids, flowmask = cmask, branchmask = cmask) #<- .state, .groupings
     return X1
 end
 
@@ -321,8 +355,18 @@ Convert a sampled state into a `ProteinStructure`.
 """
 function gen2prot(samp, chainids, resnums; name = "Gen", )
     d = Dict(zip(0:25,'A':'Z'))
-    chain_letters = get.((d,), chainids, 'Z')
-    ProteinStructure(name, Atom{eltype(tensor(samp[1]))}[], DLProteinFormats.unflatten(tensor(samp[1]), tensor(samp[2]), tensor(samp[3]), chain_letters, resnums)[1])
+    #@show chainids
+    chain_letters = get.((d,), chainids[:], 'Z')
+    #@show chain_letters
+    locs = BranchChain.tensor(samp[1])[:,:,:,1] #nm
+    rots = BranchChain.tensor(samp[2])[:,:,:,1]
+    global_ncac = BranchChain.Frames(rots, reshape(locs,3,:) .* 10)(BranchChain.ProteinChains.STANDARD_RESIDUE); #Angstroms?
+    global_atom11 = global_atom14(locs, rots, BranchChain.tensor(samp[4])[:,:,:,1]) #nm
+    at14 = cat(global_ncac ./ 10, global_atom11, dims = 2) #nm
+    struc = DLProteinFormats.unflatten(Atom14(), tensor(samp[3])[:], chain_letters, resnums[:], at14)
+    #struc = DLProteinFormats.unflatten(tensor(samp[1]), tensor(samp[2]), tensor(samp[3]), chain_letters, resnums)[1]
+    #ProteinStructure(name, Atom{eltype(tensor(samp[1]))}[], struc)
+    return struc
  end
 
 """
@@ -354,3 +398,34 @@ function load_model(checkpoint)
 end
 
 export textlog, X1_modifier, training_prep, mod_wrapper, X1_from_pdb, design, load_model
+
+local_atom14(locs, rots, atom14) = Inverse(Translation(locs) ∘ Rotation(rots))(atom14)
+global_atom14(locs, rots, atom14) = (Translation(locs) ∘ Rotation(rots))(atom14)
+
+export local_atom14, global_atom14
+
+#=
+rec = dat[1]
+local_coords = local_atom14(rec.locs, rec.rots, rec.atom14_coords)
+global_coords = global_atom14(rec.locs, rec.rots, local_coords)
+global_coords .- rec.atom14_coords
+
+struc = DLProteinFormats.unflatten(Atom14(), rec.AAs, rec.chainids, rec.resinds, rec.atom14_coords)
+
+samp = design(model, X1_from_pdb(template, to_redesign), template.name, [t.id for t in template], sampling_ff; vidpath = "testvid", device = device, path = "test.pdb");
+locs = BranchChain.tensor(samp.state[1])[:,:,:,1]
+rots = BranchChain.tensor(samp.state[2])[:,:,:,1]
+global_ncac = BranchChain.Frames(rots, reshape(locs,3,:) .* 10)(BranchChain.ProteinChains.STANDARD_RESIDUE);
+global_atom11 = global_atom14(locs, rots, BranchChain.tensor(samp.state[4])[:,:,:,1])
+cat(global_ncac, global_atom11, dims = 2)
+
+#Need to get N,Ca,C from backbone, using STANDARD_RESIDUE. This works:
+global_ncac = BranchChain.Frames(rec.rots, reshape(rec.locs,3,:) .* 10)(BranchChain.ProteinChains.STANDARD_RESIDUE);
+rec.atom14_coords[:,1:3,:] .- (global_ncac ./ 10)
+
+So we take from 4:14 of the side chain atoms, and then cat these backbone atoms deried from the frame back in.
+
+
+
+DLProteinFormats.flatten
+=#

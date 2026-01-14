@@ -26,7 +26,7 @@ X0_mean_length = 0
 deletion_pad = 1.1
 per_chain_upper_X0_len = 1 + quantile(Poisson(X0_mean_length), 0.95)
 
-rundir = "runs/branchchain_allatom_$(Date(now()))_$(rand(100000:999999))"
+rundir = "runs/branchchain_allatom3_$(Date(now()))_$(rand(100000:999999))"
 mkpath("$(rundir)/samples")
 mkpath("$(rundir)/vids")
 
@@ -44,12 +44,16 @@ clusters = [get(pdb_clusters,c,0) for c in pdbid_clean.(dat.name)] #Zero fallbac
 len_lbs = max.(length.(dat.AAs), length.(union.(dat.chainids)) .* per_chain_upper_X0_len) .* deletion_pad
 
 oldmodel = load_model("branchchain_feat64_30tune.jld");
-model = BranchChainAA1(merge(BranchChain.BranchChainAA1().layers, oldmodel.layers)) |> device;
+model = BranchChainAA2(merge(BranchChain.BranchChainAA2().layers, oldmodel.layers)) |> device;
 
 #Minimal effect upon init:
-model.layers.side_chain_embedder.weight ./= 100;
+model.layers.side_chain_embedder.weight ./= 50;
+model.layers.side_chain_rff_embedder.weight ./= 50;
 for mov in model.layers.side_chain_movers
-    mov.weight ./= 100;
+    mov.weight ./= 50;
+end
+for reemb in model.layers.side_chain_reembedders
+    reemb.weight ./= 50;
 end
 
 #=
@@ -60,6 +64,12 @@ design(model, X1_from_pdb(template, to_redesign), template.name, [t.id for t in 
 
 sched = burnin_learning_schedule(0.00001f0, 0.000250f0, 1.05f0, 0.999995f0);
 opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> any(size(x) .== 21)), model);
+
+Flux.freeze!(opt_state)
+Flux.thaw!(opt_state.layers.side_chain_embedder)
+Flux.thaw!(opt_state.layers.side_chain_movers)
+Flux.thaw!(opt_state.layers.side_chain_reembedders)
+Flux.thaw!(opt_state.layers.side_chain_rff_embedder)
 
 Flux.MLDataDevices.Internal.unsafe_free!(x) = (Flux.fmapstructure(Flux.MLDataDevices.Internal.unsafe_free_internal!, x); return nothing);
 
@@ -79,11 +89,15 @@ end
 
 starttime = now()
 textlog("$(rundir)/log.csv", ["epoch", "batch", "learning rate", "loss"])
-for epoch in 1:6
-    if epoch == 5
-        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 5800) 
+for epoch in 1:5
+    if epoch == 4
+        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 5600) 
     end
     for (i, ts) in enumerate(batchloader(; device = device))
+        if (epoch == 1) && (i == 7500)
+            Flux.thaw!(opt_state)
+            sched = burnin_learning_schedule(0.00001f0, 0.000250f0, 1.05f0, 0.999995f0);
+        end
         sc_frames = nothing
         for _ in 1:rand(Poisson(1))
             sc_frames, _ = model(ts.t', ts.Xt, ts.chainids, ts.resinds, ts.hasnobreaks, ts.chain_features, sc_frames = sc_frames)
@@ -103,7 +117,7 @@ for epoch in 1:6
             starttime = now()
         end
         textlog("$(rundir)/log.csv", [epoch, i, sched.lr, l])
-        if mod(i, 5000) == 1
+        if mod(i, 5000) == 1000
             for v in 1:3
                 try
                     sampname = "e$(epoch)_b$(i)_samp$(v)"    
@@ -131,3 +145,10 @@ end
 #design(model, template[1], template[3], template[4], sampling_ff; vidpath = "testvid", device = device, path = "test.pdb")
 #design(model, template[1], template[3], template[4], sampling_ff; vidpath = vidpath, device = device, path = "$(rundir)/samples/$(sampname).pdb")
 
+
+
+sampname = "test_samp1"    
+vidpath = "testvid1"
+feature_table[feature_table.pdb_id .== "7F5H",:]
+template = compoundstate(dat[172742], mask_override = dat[172742].chainids .== 2)
+design(model, template[1], template[3], template[4], sampling_ff; vidpath = vidpath, device = device, path = "testviiid.pdb")

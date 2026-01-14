@@ -8,7 +8,7 @@ Pkg.develop(path = "../")
 
 using BranchChain
 using Flux, Distributions, Dates
-using DLProteinFormats: load, CHAIN_FEATS_64, PDBSimpleFlatV2, PDBClusters, PDBTable, sample_batched_inds, length2batch, featurizer, CHAIN_FEATS_V1, broadcast_features, pdbid_clean
+using DLProteinFormats: load, CHAIN_FEATS_64, PDBSimpleFlatV2, Atom14, PDBClusters, PDBTable, sample_batched_inds, length2batch, featurizer, CHAIN_FEATS_V1, broadcast_features, pdbid_clean
 using LearningSchedules
 using CannotWaitForTheseOptimisers: Muon
 using JLD2: jldsave
@@ -53,7 +53,7 @@ end
 Base.length(x::BatchDataset) = length(x.batchinds)
 Base.getindex(x::BatchDataset, i) = training_prep(x.batchinds[i], dat, deletion_pad, X0_mean_length, train_ff)
 function batchloader(; device=identity, parallel=true)
-    uncapped_l2b = length2batch(1900, 1.25)
+    uncapped_l2b = length2batch(1500, 1.25)
     batchinds = sample_batched_inds(len_lbs, clusters, l2b = x -> min(uncapped_l2b(x), 100))
     @show length(batchinds)
     x = BatchDataset(batchinds)
@@ -65,7 +65,7 @@ starttime = now()
 textlog("$(rundir)/log.csv", ["epoch", "batch", "learning rate", "loss"])
 for epoch in 1:6
     if epoch == 5
-        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 5000) 
+        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 5800) 
     end
     for (i, ts) in enumerate(batchloader(; device = device))
         sc_frames = nothing

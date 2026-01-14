@@ -117,7 +117,7 @@ function step_spec(model::Union{BranchChainV2,BranchChainV3}, pdb_id, chain_labe
     return mod_wrapper
 end
 
-function step_spec(model::BranchChainAA1, pdb_id, chain_labels, feature_func; hook = nothing,
+function step_spec(model::Union{BranchChainAA1,BranchChainAA2}, pdb_id, chain_labels, feature_func; hook = nothing,
     recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing, transform_array = [])
     sc_frames = nothing
     function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)

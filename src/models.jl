@@ -392,6 +392,112 @@ end
 export BranchChainAA2
 
 
+
+
+struct BranchChainAA3{L}
+    layers::L
+end
+Flux.@layer BranchChainAA3
+function BranchChainAA3(dim::Int = 384, depth::Int = 6, f_depth::Int = 6, sidechain_dim::Int = 256; config = nothing)
+    layers = (;
+        config = config, #Suggestion: make these so you can extract them with `eval(Meta.parse(model.layers.config.X))`
+        depth = depth,
+        f_depth = f_depth,
+        mask_embedder = Embedding(2 => dim),
+        break_embedder = Embedding(2 => dim),
+        t_rff = RandomFourierFeatures(1 => dim, 1f0),
+        cond_t_encoding = Dense(dim => dim, bias=false),
+        AApre_t_encoding = Dense(dim => dim, bias=false),
+        pair_rff = RandomFourierFeatures(2 => 64, 1f0),
+        pair_project = Dense(64 => 32, bias=false),
+        AA_embedder = Embedding(21 => dim),
+        selfcond_crossipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
+        selfcond_selfipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
+        ipa_blocks = [IPAblock(dim, IPA(IPA_settings(dim, c_z = 32)), ln1 = oldAdaLN(dim, dim), ln2 = oldAdaLN(dim, dim)) for _ in 1:depth],
+        framemovers = [Framemover(dim) for _ in 1:f_depth],
+        AAdecoder = Chain(StarGLU(dim, 3dim), Dense(dim => 21, bias=false)),
+        indelpre_t_encoding = Dense(dim => 3dim),
+        count_decoder = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        del_decoder   = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        feature_embedder = Dense(64 => dim),
+
+        main_to_sides = [Dense(dim => sidechain_dim) for _ in 1:depth],
+        sides_to_main = [Dense(sidechain_dim => dim) for _ in 1:depth],
+
+        side_chain_embedder = Dense(33 => sidechain_dim),
+        side_chain_cond = Dense(dim => sidechain_dim),
+        side_chain_rff = RandomFourierFeatures(33 => 2dim, 1f0),
+        side_chain_rff_embedder = Dense(2dim => sidechain_dim),
+        side_chain_decoder = Dense(sidechain_dim => 33),
+        #Principle: we want these IPA blocks to only care about the current side chains.
+        side_chain_ipa_blocks = [IPAblock(sidechain_dim, IPA(IPA_settings(sidechain_dim, c_z = 32)), ln1 = oldAdaLN(sidechain_dim, sidechain_dim), ln2 = oldAdaLN(sidechain_dim, sidechain_dim)) for _ in 1:depth],
+        side_chain_scframes_ipa_blocks = [IPAblock(sidechain_dim, IPA(IPA_settings(sidechain_dim, c_z = 32)), ln1 = oldAdaLN(sidechain_dim, sidechain_dim), ln2 = oldAdaLN(sidechain_dim, sidechain_dim)) for _ in 1:depth],
+    )
+    return BranchChainAA3(layers)
+end
+function (fc::BranchChainAA3)(t, BSXt, chainids, resinds, breaks, chain_features; sc_frames = nothing)
+    l = fc.layers
+    Xt = BSXt.state
+    cmask = BSXt.flowmask
+
+    #Non-diff'd:
+    pmask = Flux.Zygote.@ignore self_att_padding_mask(BSXt.padmask)
+    pre_z = Flux.Zygote.@ignore l.pair_rff(pair_encode(resinds, chainids))
+    side_chain_locs = Flux.Zygote.@ignore tensor(Xt[4])
+    side_chain_rff = Flux.Zygote.@ignore l.side_chain_rff(reshape(side_chain_locs, 33, :, size(t,2)))
+    t_rff = Flux.Zygote.@ignore l.t_rff(t)
+
+    pair_feats = l.pair_project(pre_z)
+    cond = reshape(l.cond_t_encoding(t_rff), :, 1, size(t,2))
+    frames = Translation(tensor(Xt[1])) ∘ Rotation(tensor(Xt[2]))    
+    x = l.AA_embedder(tensor(Xt[3])) .+ 
+        l.mask_embedder(cmask .+ 1) .+ 
+        reshape(l.break_embedder(breaks .+ 1), :, 1, size(t,2)) .+ 
+        l.feature_embedder(chain_features .+ 0)
+        
+    #Side chains wind up as a linear projection of atom_x:
+    atom_x = l.side_chain_embedder(reshape(side_chain_locs, 33, :, size(t,2))) .+
+             l.side_chain_rff_embedder(side_chain_rff)
+    side_chain_cond = l.side_chain_cond(cond)
+
+    x_a,x_b,x_c = nothing, nothing, nothing
+    for i in 1:l.depth
+
+        #exchange info between tracks:
+        x = x + l.sides_to_main[i](atom_x)
+        atom_x = atom_x + l.main_to_sides[i](x)
+
+        if sc_frames !== nothing
+            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_selfipa[i], sc_frames, sc_frames, x, pair_feats, cond, pmask)
+            f1, f2 = mod(i, 2) == 0 ? (frames, sc_frames) : (sc_frames, frames)
+            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_crossipa[i], f1, f2, x, pair_feats, cond, pmask)
+
+            #Update side chain IPA on sc_frames:
+            atom_x = Flux.Zygote.checkpointed(ipa, l.side_chain_scframes_ipa_blocks[i], sc_frames, atom_x, pair_feats, side_chain_cond, pmask)
+        end
+        x = Flux.Zygote.checkpointed(ipa, l.ipa_blocks[i], frames, x, pair_feats, cond, pmask)
+        atom_x = Flux.Zygote.checkpointed(ipa, l.side_chain_ipa_blocks[i], frames, atom_x, pair_feats, side_chain_cond, pmask)
+        if i > l.depth - l.f_depth
+            frames = l.framemovers[i - l.depth + l.f_depth](frames, x, t = 1 .- (1 .- t .* 0.95f0).*cmask)
+        end
+        if i==4 (x_a = x) end
+        if i==5 (x_b = x) end
+        if i==6 (x_c = x) end
+    end
+    side_chain_locs = reshape(l.side_chain_decoder(atom_x), size(side_chain_locs)...)
+    aa_logits = l.AAdecoder(x .+ reshape(l.AApre_t_encoding(t_rff), :, 1, size(t,2)))
+    catted = vcat(x_a,x_b,x_c)
+    indel_pre_t = reshape(l.indelpre_t_encoding(t_rff), :, 1, size(t,2))
+    count_log = reshape(l.count_decoder(catted .+ indel_pre_t, false),  :, length(t))
+    del_logits = reshape(l.del_decoder(catted .+ indel_pre_t, false),  :, length(t))
+    return frames, aa_logits, side_chain_locs, count_log, del_logits
+end
+
+export BranchChainAA3
+
+
+
+
 P = CoalescentFlow((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), 
                      ManifoldProcess(OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0)), 
                      DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5)),
@@ -489,11 +595,13 @@ end
 
 #sigmoid that ramps up after 0.5:
 pairwise_weight(time::T) where T = T(1 / (1 + exp(-20 * (time - T(0.5)))))
+batch_sq_dists(p) = clamp.(Onion.pairwise_sqeuclidean(Onion.rearrange(p, Onion.einops"d 1 l b -> l d b"), Onion.rearrange(p, Onion.einops"d 1 l b -> d l b")), 0f0, 10000f0)
 batch_dists(p) = sqrt.(clamp.(Onion.pairwise_sqeuclidean(Onion.rearrange(p, Onion.einops"d 1 l b -> l d b"), Onion.rearrange(p, Onion.einops"d 1 l b -> d l b")), 0f0, 10000f0) .+ 1f-6)
 dist_scaling(d) = 1 ./ (1 .+ d)
 
 pair_and_mask(floatmask) = Onion.rearrange(floatmask, Onion.einops"n ... -> 1 n ...") .* Onion.rearrange(floatmask, Onion.einops"n ... -> n 1 ...")
 pair_or_mask(floatmask) = clamp.(Onion.rearrange(floatmask, Onion.einops"n ... -> 1 n ...") .+ Onion.rearrange(floatmask, Onion.einops"n ... -> n 1 ..."), 0f0, 1f0)
+
 
 function aux_losses(hat_frames, ts; pair_weight = pairwise_weight, batch_dists = batch_dists, dist_scaling = dist_scaling)
     times = ts.t
@@ -507,4 +615,176 @@ function aux_losses(hat_frames, ts; pair_weight = pairwise_weight, batch_dists =
     return 100 * sum(weighted_dists) / sum(scal)
 end
 
+
+function aux_atom11_loss(hat_frames, hat_side_chain_locs, ts; pair_weight = pairwise_weight, batch_dists = batch_dists, dist_scaling = dist_scaling)
+    times = ts.t
+    time_weights = reshape(pair_weight.(times), 1, 1, 1, 1, length(times))
+
+    mask = pair_and_mask(ts.Xt.padmask .+ 0) .* pair_or_mask(ts.Xt.branchmask .+ 0) # LxLxB
+
+    # Distance scaling derived from centroid (anchor) distances, to match aux_losses
+    centroid_dists = batch_dists(ts.X1_locs_target.S.state) # LxLxB
+    scal = dist_scaling(centroid_dists) .* mask              # LxLxB
+
+    global_true_atoms = ts.globalX1atom14                # 3x11xLxB
+    global_pred_atoms = hat_frames(hat_side_chain_locs)  # 3x11xLxB
+
+    na = size(global_true_atoms, 2) # 11
+    L = size(global_true_atoms, 3)
+    B = size(global_true_atoms, 4)
+
+    # Flatten (atom, residue) into a single axis so we can reuse batch_dists unchanged
+    true_flat = reshape(global_true_atoms, 3, 1, na * L, B)
+    pred_flat = reshape(global_pred_atoms, 3, 1, na * L, B)
+
+    true_atom_dists = reshape(batch_dists(true_flat), na, L, na, L, B)
+    pred_atom_dists = reshape(batch_dists(pred_flat), na, L, na, L, B)
+
+    scal5 = reshape(scal, 1, L, 1, L, B) # broadcast across atom-pair dims
+    weighted_dists = ((pred_atom_dists .- true_atom_dists).^2 .+ 1f-6) .* scal5 .* time_weights
+
+    return 100 * sum(weighted_dists) / (sum(scal) * (na * na))
+end
+
+
+function aux_atom11_to_centroid_loss(hat_frames, hat_side_chain_locs, ts; pair_weight = pairwise_weight, batch_dists = batch_dists, dist_scaling = dist_scaling)
+    times = ts.t
+    time_weights = reshape(pair_weight.(times), 1, 1, 1, length(times))
+
+    mask = pair_and_mask(ts.Xt.padmask .+ 0) .* pair_or_mask(ts.Xt.branchmask .+ 0) # LxLxB
+
+    # scaling derived from centroid distances, same as aux_losses
+    centroid_dists = batch_dists(ts.X1_locs_target.S.state) # LxLxB
+    scal = dist_scaling(centroid_dists) .* mask              # LxLxB
+
+    # "cross" distances between two point sets, written with the same Onion ops as batch_dists
+    cross_batch_dists(pA, pB) = sqrt.(clamp.(Onion.pairwise_sqeuclidean(
+        Onion.rearrange(pA, Onion.einops"d 1 l b -> l d b"),
+        Onion.rearrange(pB, Onion.einops"d 1 l b -> d l b")
+    ), 0f0, 10000f0) .+ 1f-6)
+
+    global_true_atoms = ts.globalX1atom14               # 3x11xLxB
+    global_pred_atoms = hat_frames(hat_side_chain_locs) # 3x11xLxB
+
+    na = size(global_true_atoms, 2) # 11
+    L = size(global_true_atoms, 3)
+    B = size(global_true_atoms, 4)
+
+    true_centroids = ts.X1_locs_target.S.state                         # 3x1xLxB
+    pred_centroids = values(BranchChain.BatchedTransformations.translation(hat_frames)) # 3x1xLxB
+
+    # Flatten (atom, residue) -> one axis (na*L) so we compute (na*L) x L x B, then reshape
+    true_atoms_flat = reshape(global_true_atoms, 3, 1, na * L, B)
+    pred_atoms_flat = reshape(global_pred_atoms, 3, 1, na * L, B)
+
+    true_atom_to_centroid = reshape(cross_batch_dists(true_atoms_flat, true_centroids), na, L, L, B)
+    pred_atom_to_centroid = reshape(cross_batch_dists(pred_atoms_flat, pred_centroids), na, L, L, B)
+
+    scal4 = reshape(scal, 1, L, L, B) # broadcast over atom dim
+    weighted_dists = ((pred_atom_to_centroid .- true_atom_to_centroid).^2 .+ 1f-6) .* scal4 .* time_weights
+
+    return 100 * sum(weighted_dists) / (sum(scal) * na)
+end
+
+export aux_atom11_loss
+export aux_atom11_to_centroid_loss
+
+
+#11x11xLxLxB
+
 export BranchChainV1, losses, aux_losses, X0sampler, compoundstate
+
+
+
+# Gram over feature dimension, per batch:
+# F: d×L×B  ->  G: L×L×B with G[:,:,b] = F[:,:,b]' * F[:,:,b]
+gram(F) = batched_mul(permutedims(F, (2,1,3)), F)
+
+# For true/pred atoms (3×na×L×B), returns L×L×B:
+#   Σ_{a∈i}Σ_{b∈j} ( ||hat_x[i,a]-hat_x[j,b]||^2 - ||x[i,a]-x[j,b]||^2 )^2
+# computed without forming na×na blocks.
+function residuepair_atomblock_sqdistdiff2(true_atoms, pred_atoms)
+    @assert size(true_atoms) == size(pred_atoms)
+    @assert size(true_atoms, 1) == 3
+
+    na = size(true_atoms, 2)
+    L  = size(true_atoms, 3)
+    B  = size(true_atoms, 4)
+
+    # u = ||A||^2 - ||H||^2 : 1×na×L×B
+    u = sum(abs2, true_atoms; dims=1) .- sum(abs2, pred_atoms; dims=1)
+
+    # Per-residue scalars: L×B
+    U1 = dropdims(sum(u; dims=2); dims=(1,2))           # Σ_a u
+    U2 = dropdims(sum(abs2, u; dims=2); dims=(1,2))     # Σ_a u^2
+
+    # Per-residue vectors: 3×L×B
+    sA = dropdims(sum(true_atoms; dims=2); dims=2)      # Σ_a A
+    sH = dropdims(sum(pred_atoms; dims=2); dims=2)      # Σ_a H
+    tA = dropdims(sum(true_atoms .* u; dims=2); dims=2) # Σ_a u*A
+    tH = dropdims(sum(pred_atoms .* u; dims=2); dims=2) # Σ_a u*H
+
+    # Per-residue 3×3 matrices via batched GEMM over (L*B) residues
+    A3 = reshape(true_atoms, 3, na, L*B)
+    H3 = reshape(pred_atoms, 3, na, L*B)
+    At = permutedims(A3, (2,1,3))  # na×3×(L*B)
+    Ht = permutedims(H3, (2,1,3))
+
+    P  = batched_mul(A3, At)       # 3×3×(L*B) = A*A'
+    Q  = batched_mul(H3, Ht)       # 3×3×(L*B) = H*H'
+    M  = batched_mul(A3, Ht)       # 3×3×(L*B) = A*H'
+
+    # Flatten 3×3 -> 9 and reshape to 9×L×B so we can Gram them across residues
+    P9 = reshape(P, 9, L, B)
+    Q9 = reshape(Q, 9, L, B)
+    M9 = reshape(M, 9, L, B)
+
+    # Term1: na*(U2_i+U2_j) + 2*U1_i*U1_j
+    term1 = na .* (reshape(U2, L, 1, B) .+ reshape(U2, 1, L, B)) .+
+            2  .* (reshape(U1, L, 1, B) .* reshape(U1, 1, L, B))
+
+    # Term2: 4( <P_i,P_j> + <Q_i,Q_j> - 2<M_i,M_j> )
+    term2 = 4 .* (gram(P9) .+ gram(Q9) .- 2 .* gram(M9))
+
+    # Cross term: -4( X + X' ), X = tA' sA - tH' sH
+    X = batched_mul(permutedims(tA, (2,1,3)), sA) .- batched_mul(permutedims(tH, (2,1,3)), sH)
+    term3 = -4 .* (X .+ permutedims(X, (2,1,3)))
+
+    return term1 .+ term2 .+ term3  # L×L×B
+end
+
+function aux_atom11_loss_fast(
+    hat_frames, hat_side_chain_locs, ts;
+    pair_weight = pairwise_weight,
+    batch_dists = batch_dists,
+    dist_scaling = dist_scaling,
+)
+    times = ts.t
+    time_w = reshape(pair_weight.(times), 1, 1, length(times))   # 1×1×B (assumes length(times)==B)
+
+    mask = pair_and_mask(ts.Xt.padmask .+ 0) .* pair_or_mask(ts.Xt.branchmask .+ 0) # L×L×B
+
+    # RBF-style scaling:
+    centroid_sq_dists = batch_sq_dists(ts.X1_locs_target.S.state) # L×L×B
+    pre_mask_scal = exp.(-5 .* centroid_sq_dists)
+    scal = pre_mask_scal .* mask
+
+
+    global_true_atoms = ts.globalX1atom14                # 3×11×L×B
+    global_pred_atoms = hat_frames(hat_side_chain_locs)  # 3×11×L×B
+
+    na = size(global_true_atoms, 2)
+    L  = size(global_true_atoms, 3)
+    B  = size(global_true_atoms, 4)
+    @assert length(times) == B
+
+    # Lblock[i,j,b] = Σ_{atom pairs} (Δ sqdist)^2 for residue pair (i,j) at batch b
+    Lblock = residuepair_atomblock_sqdistdiff2(global_true_atoms, global_pred_atoms)  # L×L×B
+    
+    eps = 1f-6 #Not sure we need this anymore...
+    per_pair = (Lblock .+ (eps * (na * na))) .* (scal .* time_w)  # L×L×B
+
+    return 100 * sum(per_pair) / (sum(scal) * (na * na))
+end
+
+export aux_atom11_loss_fast

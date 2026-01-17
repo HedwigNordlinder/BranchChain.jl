@@ -65,7 +65,7 @@ function training_prep(b, dat, deletion_pad, X0_mean_length, feature_func; P = P
     return (;t = bat.t, chainids = bat.Xt.groupings, resinds,
                     Xt = bat.Xt, hasnobreaks = hasnobreaks,
                     rotξ_target = rotξ, X1_locs_target = bat.X1anchor[1], X1aas_target = bat.X1anchor[3],
-                    splits_target = bat.splits_target, del = bat.del, chain_features, X1atom14_target = bat.X1anchor[4])
+                    splits_target = bat.splits_target, del = bat.del, chain_features, X1atom14_target = bat.X1anchor[4], globalX1atom14 = global_atom14(tensor(bat.X1anchor[1]), tensor(bat.X1anchor[2]), tensor(bat.X1anchor[4])))
 end
 
 """
@@ -117,7 +117,7 @@ function step_spec(model::Union{BranchChainV2,BranchChainV3}, pdb_id, chain_labe
     return mod_wrapper
 end
 
-function step_spec(model::Union{BranchChainAA1,BranchChainAA2}, pdb_id, chain_labels, feature_func; hook = nothing,
+function step_spec(model::Union{BranchChainAA1,BranchChainAA2,BranchChainAA3}, pdb_id, chain_labels, feature_func; hook = nothing,
     recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing, transform_array = [])
     sc_frames = nothing
     function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)

@@ -619,8 +619,7 @@ export BranchChainLS1
 P = CoalescentFlow((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), 
                      ManifoldProcess(OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0)), 
                      DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5)),
-                     #OUBridgeExpVar(1f0, 1.5f0, 0.000000001f0, dec = -3f0), #<-First training run used this.
-                     OUBridgeExpVar(100f0, 50f0, 0.000000001f0, dec = -0.1f0), #New, higher noise. Needs X0 std of 0.5.
+                     OUBridgeExpVar(100f0, 50f0, 0.000000001f0, dec = -0.1f0), #Was first attempt with latents, but concerned it resolved too early
                      NullProcess()), 
                     Beta(1,2))
 

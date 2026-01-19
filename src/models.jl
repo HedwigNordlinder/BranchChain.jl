@@ -392,6 +392,230 @@ end
 export BranchChainAA2
 
 
+
+
+struct BranchChainAA3{L}
+    layers::L
+end
+Flux.@layer BranchChainAA3
+function BranchChainAA3(dim::Int = 384, depth::Int = 6, f_depth::Int = 6, sidechain_dim::Int = 256; config = nothing)
+    layers = (;
+        config = config, #Suggestion: make these so you can extract them with `eval(Meta.parse(model.layers.config.X))`
+        depth = depth,
+        f_depth = f_depth,
+        mask_embedder = Embedding(2 => dim),
+        break_embedder = Embedding(2 => dim),
+        t_rff = RandomFourierFeatures(1 => dim, 1f0),
+        cond_t_encoding = Dense(dim => dim, bias=false),
+        AApre_t_encoding = Dense(dim => dim, bias=false),
+        pair_rff = RandomFourierFeatures(2 => 64, 1f0),
+        pair_project = Dense(64 => 32, bias=false),
+        AA_embedder = Embedding(21 => dim),
+        selfcond_crossipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
+        selfcond_selfipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
+        ipa_blocks = [IPAblock(dim, IPA(IPA_settings(dim, c_z = 32)), ln1 = oldAdaLN(dim, dim), ln2 = oldAdaLN(dim, dim)) for _ in 1:depth],
+        framemovers = [Framemover(dim) for _ in 1:f_depth],
+        AAdecoder = Chain(StarGLU(dim, 3dim), Dense(dim => 21, bias=false)),
+        indelpre_t_encoding = Dense(dim => 3dim),
+        count_decoder = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        del_decoder   = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        feature_embedder = Dense(64 => dim),
+
+        main_to_sides = [Dense(dim => sidechain_dim) for _ in 1:depth],
+        sides_to_main = [Dense(sidechain_dim => dim) for _ in 1:depth],
+
+        side_chain_embedder = Dense(33 => sidechain_dim),
+        side_chain_cond = Dense(dim => sidechain_dim),
+        side_chain_rff = RandomFourierFeatures(33 => 2dim, 1f0),
+        side_chain_rff_embedder = Dense(2dim => sidechain_dim),
+        side_chain_decoder = Dense(sidechain_dim => 33),
+        #Principle: we want these IPA blocks to only care about the current side chains.
+        side_chain_ipa_blocks = [IPAblock(sidechain_dim, IPA(IPA_settings(sidechain_dim, c_z = 32)), ln1 = oldAdaLN(sidechain_dim, sidechain_dim), ln2 = oldAdaLN(sidechain_dim, sidechain_dim)) for _ in 1:depth],
+        side_chain_scframes_ipa_blocks = [IPAblock(sidechain_dim, IPA(IPA_settings(sidechain_dim, c_z = 32)), ln1 = oldAdaLN(sidechain_dim, sidechain_dim), ln2 = oldAdaLN(sidechain_dim, sidechain_dim)) for _ in 1:depth],
+    )
+    return BranchChainAA3(layers)
+end
+function (fc::BranchChainAA3)(t, BSXt, chainids, resinds, breaks, chain_features; sc_frames = nothing)
+    l = fc.layers
+    Xt = BSXt.state
+    cmask = BSXt.flowmask
+
+    #Non-diff'd:
+    pmask = Flux.Zygote.@ignore self_att_padding_mask(BSXt.padmask)
+    pre_z = Flux.Zygote.@ignore l.pair_rff(pair_encode(resinds, chainids))
+    side_chain_locs = Flux.Zygote.@ignore tensor(Xt[4])
+    side_chain_rff = Flux.Zygote.@ignore l.side_chain_rff(reshape(side_chain_locs, 33, :, size(t,2)))
+    t_rff = Flux.Zygote.@ignore l.t_rff(t)
+
+    pair_feats = l.pair_project(pre_z)
+    cond = reshape(l.cond_t_encoding(t_rff), :, 1, size(t,2))
+    frames = Translation(tensor(Xt[1])) ∘ Rotation(tensor(Xt[2]))    
+    x = l.AA_embedder(tensor(Xt[3])) .+ 
+        l.mask_embedder(cmask .+ 1) .+ 
+        reshape(l.break_embedder(breaks .+ 1), :, 1, size(t,2)) .+ 
+        l.feature_embedder(chain_features .+ 0)
+        
+    #Side chains wind up as a linear projection of atom_x:
+    atom_x = l.side_chain_embedder(reshape(side_chain_locs, 33, :, size(t,2))) .+
+             l.side_chain_rff_embedder(side_chain_rff)
+    side_chain_cond = l.side_chain_cond(cond)
+
+    x_a,x_b,x_c = nothing, nothing, nothing
+    for i in 1:l.depth
+
+        #exchange info between tracks:
+        x = x + l.sides_to_main[i](atom_x)
+        atom_x = atom_x + l.main_to_sides[i](x)
+
+        if sc_frames !== nothing
+            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_selfipa[i], sc_frames, sc_frames, x, pair_feats, cond, pmask)
+            f1, f2 = mod(i, 2) == 0 ? (frames, sc_frames) : (sc_frames, frames)
+            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_crossipa[i], f1, f2, x, pair_feats, cond, pmask)
+
+            #Update side chain IPA on sc_frames:
+            atom_x = Flux.Zygote.checkpointed(ipa, l.side_chain_scframes_ipa_blocks[i], sc_frames, atom_x, pair_feats, side_chain_cond, pmask)
+        end
+        x = Flux.Zygote.checkpointed(ipa, l.ipa_blocks[i], frames, x, pair_feats, cond, pmask)
+        atom_x = Flux.Zygote.checkpointed(ipa, l.side_chain_ipa_blocks[i], frames, atom_x, pair_feats, side_chain_cond, pmask)
+        if i > l.depth - l.f_depth
+            frames = l.framemovers[i - l.depth + l.f_depth](frames, x, t = 1 .- (1 .- t .* 0.95f0).*cmask)
+        end
+        if i==4 (x_a = x) end
+        if i==5 (x_b = x) end
+        if i==6 (x_c = x) end
+    end
+    side_chain_locs = reshape(l.side_chain_decoder(atom_x), size(side_chain_locs)...)
+    aa_logits = l.AAdecoder(x .+ reshape(l.AApre_t_encoding(t_rff), :, 1, size(t,2)))
+    catted = vcat(x_a,x_b,x_c)
+    indel_pre_t = reshape(l.indelpre_t_encoding(t_rff), :, 1, size(t,2))
+    count_log = reshape(l.count_decoder(catted .+ indel_pre_t, false),  :, length(t))
+    del_logits = reshape(l.del_decoder(catted .+ indel_pre_t, false),  :, length(t))
+    return frames, aa_logits, side_chain_locs, count_log, del_logits
+end
+
+export BranchChainAA3
+
+
+model_d = 256
+encoder = Chain(
+    Dense(33 => 256, swish),
+    LayerNorm(256),
+    StarGLU(256, 2*256),
+    LayerNorm(256),
+    Dense(256 => 8),
+)
+decoder = Chain(
+    Dense(8 => 256, swish),
+    LayerNorm(256),
+    StarGLU(256, 2*256),
+    LayerNorm(256),
+    Dense(256 => 33),
+)
+side_chain_SWAE_model = (; encoder, decoder)
+
+
+struct BranchChainLS1{L}
+    layers::L
+end
+Flux.@layer BranchChainLS1
+function BranchChainLS1(dim::Int = 384, depth::Int = 6, f_depth::Int = 6, sidechain_dim::Int = 256; config = nothing)
+    layers = (;
+        config = config, #Suggestion: make these so you can extract them with `eval(Meta.parse(model.layers.config.X))`
+        depth = depth,
+        f_depth = f_depth,
+        mask_embedder = Embedding(2 => dim),
+        break_embedder = Embedding(2 => dim),
+        t_rff = RandomFourierFeatures(1 => dim, 1f0),
+        cond_t_encoding = Dense(dim => dim, bias=false),
+        AApre_t_encoding = Dense(dim => dim, bias=false),
+        pair_rff = RandomFourierFeatures(2 => 64, 1f0),
+        pair_project = Dense(64 => 32, bias=false),
+        AA_embedder = Embedding(21 => dim),
+        selfcond_crossipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
+        selfcond_selfipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
+        ipa_blocks = [IPAblock(dim, IPA(IPA_settings(dim, c_z = 32)), ln1 = oldAdaLN(dim, dim), ln2 = oldAdaLN(dim, dim)) for _ in 1:depth],
+        framemovers = [Framemover(dim) for _ in 1:f_depth],
+        AAdecoder = Chain(StarGLU(dim, 3dim), Dense(dim => 21, bias=false)),
+        indelpre_t_encoding = Dense(dim => 3dim),
+        count_decoder = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        del_decoder   = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        feature_embedder = Dense(64 => dim),
+
+        main_to_sides = [Dense(dim => sidechain_dim) for _ in 1:depth],
+        sides_to_main = [Dense(sidechain_dim => dim) for _ in 1:depth],
+
+        side_chain_embedder = Dense(8 => sidechain_dim),
+        side_chain_cond = Dense(dim => sidechain_dim),
+        side_chain_rff = RandomFourierFeatures(8 => 2dim, 1f0),
+        side_chain_rff_embedder = Dense(2dim => sidechain_dim),
+        side_chain_decoder = Dense(sidechain_dim => 8),
+        #Principle: we want these IPA blocks to only care about the current side chains.
+        side_chain_ipa_blocks = [IPAblock(sidechain_dim, IPA(IPA_settings(sidechain_dim, c_z = 32)), ln1 = oldAdaLN(sidechain_dim, sidechain_dim), ln2 = oldAdaLN(sidechain_dim, sidechain_dim)) for _ in 1:depth],
+        side_chain_scframes_ipa_blocks = [IPAblock(sidechain_dim, IPA(IPA_settings(sidechain_dim, c_z = 32)), ln1 = oldAdaLN(sidechain_dim, sidechain_dim), ln2 = oldAdaLN(sidechain_dim, sidechain_dim)) for _ in 1:depth],
+    )
+    return BranchChainLS1(layers)
+end
+function (fc::BranchChainLS1)(t, BSXt, chainids, resinds, breaks, chain_features; sc_frames = nothing)
+    l = fc.layers
+    Xt = BSXt.state
+    cmask = BSXt.flowmask
+
+    #Non-diff'd:
+    pmask = Flux.Zygote.@ignore self_att_padding_mask(BSXt.padmask)
+    pre_z = Flux.Zygote.@ignore l.pair_rff(pair_encode(resinds, chainids))
+    side_chain_locs = Flux.Zygote.@ignore tensor(Xt[4])
+    side_chain_rff = Flux.Zygote.@ignore l.side_chain_rff(side_chain_locs)
+    t_rff = Flux.Zygote.@ignore l.t_rff(t)
+
+    pair_feats = l.pair_project(pre_z)
+    cond = reshape(l.cond_t_encoding(t_rff), :, 1, size(t,2))
+    frames = Translation(tensor(Xt[1])) ∘ Rotation(tensor(Xt[2]))    
+    x = l.AA_embedder(tensor(Xt[3])) .+ 
+        l.mask_embedder(cmask .+ 1) .+ 
+        reshape(l.break_embedder(breaks .+ 1), :, 1, size(t,2)) .+ 
+        l.feature_embedder(chain_features .+ 0)
+        
+    #Side chains wind up as a linear projection of atom_x:
+    atom_x = l.side_chain_embedder(side_chain_locs) .+ l.side_chain_rff_embedder(side_chain_rff)
+    side_chain_cond = l.side_chain_cond(cond)
+
+    x_a,x_b,x_c = nothing, nothing, nothing
+    for i in 1:l.depth
+
+        #exchange info between tracks:
+        x = x + l.sides_to_main[i](atom_x)
+        atom_x = atom_x + l.main_to_sides[i](x)
+
+        if sc_frames !== nothing
+            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_selfipa[i], sc_frames, sc_frames, x, pair_feats, cond, pmask)
+            f1, f2 = mod(i, 2) == 0 ? (frames, sc_frames) : (sc_frames, frames)
+            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_crossipa[i], f1, f2, x, pair_feats, cond, pmask)
+
+            #Update side chain IPA on sc_frames:
+            atom_x = Flux.Zygote.checkpointed(ipa, l.side_chain_scframes_ipa_blocks[i], sc_frames, atom_x, pair_feats, side_chain_cond, pmask)
+        end
+        x = Flux.Zygote.checkpointed(ipa, l.ipa_blocks[i], frames, x, pair_feats, cond, pmask)
+        atom_x = Flux.Zygote.checkpointed(ipa, l.side_chain_ipa_blocks[i], frames, atom_x, pair_feats, side_chain_cond, pmask)
+        if i > l.depth - l.f_depth
+            frames = l.framemovers[i - l.depth + l.f_depth](frames, x, t = 1 .- (1 .- t .* 0.95f0).*cmask)
+        end
+        if i==4 (x_a = x) end
+        if i==5 (x_b = x) end
+        if i==6 (x_c = x) end
+    end
+    side_chain_locs = l.side_chain_decoder(atom_x)
+    aa_logits = l.AAdecoder(x .+ reshape(l.AApre_t_encoding(t_rff), :, 1, size(t,2)))
+    catted = vcat(x_a,x_b,x_c)
+    indel_pre_t = reshape(l.indelpre_t_encoding(t_rff), :, 1, size(t,2))
+    count_log = reshape(l.count_decoder(catted .+ indel_pre_t, false),  :, length(t))
+    del_logits = reshape(l.del_decoder(catted .+ indel_pre_t, false),  :, length(t))
+    return frames, aa_logits, side_chain_locs, count_log, del_logits
+end
+
+export BranchChainLS1
+
+
+
 P = CoalescentFlow((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), 
                      ManifoldProcess(OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0)), 
                      DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5)),
@@ -413,7 +637,7 @@ X0sampler(root) = (ContinuousState(randn(Float32, 3, 1, 1)),
                     ManifoldState(rotM, reshape(Array{Float32}.(Flowfusion.rand(rotM, 1)), 1)),
                     DiscreteState(21, [21]),
                     #ContinuousState(randn(Float32, 3, 11, 1) ./ 5), #std=0.2 - similar to side chain std in nm
-                    ContinuousState(randn(Float32, 3, 11, 1) ./ 2), #std=0.5 - more noise
+                    ContinuousState(randn(Float32, 8, 1)), #std=0.5 - more noise
                     DiscreteState(0, [1]) #<-INDEXING STATE.
 )
 
@@ -447,12 +671,12 @@ function compoundstate(rec; mask_override = nothing)
     any(.!cmask) && (center_ind = rand(findall(.!cmask)))
     center = rec.locs[:,:,center_ind] .+ randn(Float32, 3, 1, 1)
     centered_locs = rec.locs .- center
-    centered_atom14 = local_atom14(centered_locs, rec.rots, rec.atom14_coords .- center)[:,4:14,:]
+    #centered_atom14 = local_atom14(centered_locs, rec.rots, rec.atom14_coords .- center)[:,4:14,:]
     breaks = nobreaks(rec.resinds, rec.chainids, cmask)
     X1locs = MaskedState(ContinuousState(centered_locs), cmask, cmask)
     X1rots = MaskedState(ManifoldState(rotM,eachslice(rec.rots, dims=3)), cmask, cmask)
     X1aas = MaskedState((DiscreteState(21, rec.AAs)), cmask, cmask)
-    X1atom14 = MaskedState(ContinuousState(centered_atom14), cmask, cmask)
+    X1atom14 = MaskedState(ContinuousState(rec.latent_sc), cmask, cmask)
     index_state = MaskedState((DiscreteState(0, [1:L;])), cmask, cmask)
     X1 = BranchingState((X1locs, X1rots, X1aas, X1atom14, index_state), Int.(rec.chainids), flowmask = cmask, branchmask = cmask) #<- .state, .groupings
     return X1, breaks, DLProteinFormats.pdbid_clean(rec.name), rec.chain_labels
@@ -481,7 +705,7 @@ function losses(P, X1hat, ts)
     l_loc = floss(P.P[1], hat_loc, ts.X1_locs_target,                scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 20
     l_rot = floss(P.P[2], hat_rot, ts.rotξ_target,                   scalefloss(P.P[2], ts.t, 1, 0.2f0)) * 2
     l_aas = floss(P.P[3], hat_aas, onehot(ts.X1aas_target),          scalefloss(P.P[3], ts.t, 1, 0.2f0)) / 10
-    l_atom14 = floss(P.P[4], hat_atom14, ts.X1atom14_target, scalefloss(P.P[4], ts.t, 1, 0.2f0)) * 20
+    l_atom14 = floss(P.P[4], hat_atom14, ts.X1atom14_target, scalefloss(P.P[4], ts.t, 1, 0.2f0))
     splits_loss = floss(P, hat_splits, ts.splits_target, ts.Xt.padmask .* ts.Xt.branchmask, scalefloss(P, ts.t, 1, 0.2f0))
     del_loss = floss(P.deletion_policy, hat_del, ts.del, ts.Xt.padmask .* ts.Xt.branchmask, scalefloss(P, ts.t, 1, 0.2f0))
     return l_loc, l_rot, l_aas, l_atom14, splits_loss, del_loss
@@ -489,11 +713,13 @@ end
 
 #sigmoid that ramps up after 0.5:
 pairwise_weight(time::T) where T = T(1 / (1 + exp(-20 * (time - T(0.5)))))
+batch_sq_dists(p) = clamp.(Onion.pairwise_sqeuclidean(Onion.rearrange(p, Onion.einops"d 1 l b -> l d b"), Onion.rearrange(p, Onion.einops"d 1 l b -> d l b")), 0f0, 10000f0)
 batch_dists(p) = sqrt.(clamp.(Onion.pairwise_sqeuclidean(Onion.rearrange(p, Onion.einops"d 1 l b -> l d b"), Onion.rearrange(p, Onion.einops"d 1 l b -> d l b")), 0f0, 10000f0) .+ 1f-6)
 dist_scaling(d) = 1 ./ (1 .+ d)
 
 pair_and_mask(floatmask) = Onion.rearrange(floatmask, Onion.einops"n ... -> 1 n ...") .* Onion.rearrange(floatmask, Onion.einops"n ... -> n 1 ...")
 pair_or_mask(floatmask) = clamp.(Onion.rearrange(floatmask, Onion.einops"n ... -> 1 n ...") .+ Onion.rearrange(floatmask, Onion.einops"n ... -> n 1 ..."), 0f0, 1f0)
+
 
 function aux_losses(hat_frames, ts; pair_weight = pairwise_weight, batch_dists = batch_dists, dist_scaling = dist_scaling)
     times = ts.t
@@ -508,3 +734,4 @@ function aux_losses(hat_frames, ts; pair_weight = pairwise_weight, batch_dists =
 end
 
 export BranchChainV1, losses, aux_losses, X0sampler, compoundstate
+

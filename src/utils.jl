@@ -41,8 +41,8 @@ For batch indices `b`, samples masked terminal states from `dat`, builds a branc
 returns a named tuple with all inputs and targets needed by `BranchChainV1`
 and `losses`.
 """
-function training_prep(b, dat, deletion_pad, X0_mean_length, feature_func; P = P)
-    sampled = compoundstate.(dat[b])
+function training_prep(b, dat, deletion_pad, X0_mean_length, feature_func, latent_side_chains; P = P)
+    sampled = compoundstate.(merge(dat[i], (;latent_sc = latent_side_chains[i])) for i in b)
     X1s = [s[1] for s in sampled]
     hasnobreaks = [s[2] for s in sampled]
     pdb_ids = [s[3] for s in sampled]
@@ -65,7 +65,7 @@ function training_prep(b, dat, deletion_pad, X0_mean_length, feature_func; P = P
     return (;t = bat.t, chainids = bat.Xt.groupings, resinds,
                     Xt = bat.Xt, hasnobreaks = hasnobreaks,
                     rotξ_target = rotξ, X1_locs_target = bat.X1anchor[1], X1aas_target = bat.X1anchor[3],
-                    splits_target = bat.splits_target, del = bat.del, chain_features, X1atom14_target = bat.X1anchor[4], globalX1atom14 = global_atom14(tensor(bat.X1anchor[1]), tensor(bat.X1anchor[2]), tensor(bat.X1anchor[4])))
+                    splits_target = bat.splits_target, del = bat.del, chain_features, X1atom14_target = bat.X1anchor[4])
 end
 
 """
@@ -148,6 +148,39 @@ function step_spec(model::Union{BranchChainAA1,BranchChainAA2,BranchChainAA3}, p
     end
     return mod_wrapper
 end
+
+function step_spec(model::Union{BranchChainLS1}, pdb_id, chain_labels, feature_func; hook = nothing, side_chain_decoder = nothing,
+    recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing, transform_array = [])
+    sc_frames = nothing
+    function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)
+        !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", Xₜ.state, Xₜ.groupings, collect(1:length(Xₜ.groupings)); side_chain_decoder = side_chain_decoder)
+        Xtstate = Xₜ.state
+        frominds = Xtstate[5].S.state[:]
+        chain_features = broadcast_features([pdb_id], [chain_labels], Xₜ.groupings, (a,b) -> feature_func(a,b,override = feature_override))
+        if !isnothing(sc_frames)
+            sc_frames = Translation(sc_frames.composed.outer.values[:,:,frominds,:]) ∘ Rotation(sc_frames.composed.inner.values[:,:,frominds,:])
+        end
+        printseq && println(replace(DLProteinFormats.ints_to_aa(tensor(Xtstate[3])[:]), "X"=>"-"), ":", frameid[1])
+        if length(tensor(Xtstate[3])[:]) > 2000
+            error("Chain too long")
+        end
+        resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
+        input_bundle = ([t]', Xₜ, Xₜ.groupings, resinds, [true], chain_features) |> device
+        for _ in 1:recycles
+            sc_frames, _ = model(input_bundle..., sc_frames = device(sc_frames))
+        end
+        pred = model(input_bundle..., sc_frames = device(sc_frames)) |> cpu
+        sc_frames = deepcopy(pred[1])
+        state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(values(linear(pred[1])), dims=(3,4))), pred[2], ContinuousState(pred[3]), nothing
+        !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", (state_pred[1], state_pred[2], Xₜ.state[3], state_pred[4]), Xₜ.groupings, collect(1:length(Xₜ.groupings)); side_chain_decoder = side_chain_decoder)
+        !isnothing(hook) && hook(Xₜ.groupings, Xₜ.state, state_pred)
+        frameid[1] += 1
+        Xtstate[5].S.state .= 1:length(Xtstate[5].S.state) #<-Update the indexing state? Not being used.
+        return state_pred, pred[4], pred[5]
+    end
+    return mod_wrapper
+end
+
 
 #Alternative: Define "matched state" which holds on to a transform_array.
 #step will take the first part for some elements (eg. the discrete ones) but maintain the full state space for the others.
@@ -311,7 +344,7 @@ Returns the final sampled branching state `samp`.
 """
 #Needs to consider features/feature modifications.
 #This should be generalized to also be allowed to take in features directly. Or something.
-function design(model, X1, pdb_id, chain_labels, feature_func; transform_array = [], t0 = 0f0, steps = step_sched.(t0:0.005:1f0),
+function design(model, X1, pdb_id, chain_labels, feature_func; side_chain_decoder = nothing, transform_array = [], t0 = 0f0, steps = step_sched.(t0:0.005:1f0),
                 path = nothing, vidpath = nothing, printseq = true, device = identity, feature_override = nothing, hook = nothing,
                 P = P, X0_mean_length = model.layers.config.X0_mean_length_minus_1, deletion_pad = model.layers.config.deletion_pad, recycles = 0)
     if steps isa Number
@@ -332,12 +365,12 @@ function design(model, X1, pdb_id, chain_labels, feature_func; transform_array =
         mkpath(vidpath*"/Xt")
         mkpath(vidpath*"/X1hat")
     end
-    samp = gen(P, X0, step_spec(model, pdb_id, chain_labels, feature_func; vidpath, printseq, device, frameid, recycles, feature_override, transform_array, hook), steps)
+    samp = gen(P, X0, step_spec(model, pdb_id, chain_labels, feature_func; side_chain_decoder = side_chain_decoder, vidpath, printseq, device, frameid, recycles, feature_override, transform_array, hook), steps)
     expanded_samp = expand_state(samp, transform_array)
     printseq && println(replace(DLProteinFormats.ints_to_aa(tensor(expanded_samp.state[3])[:]), "X"=>"-"), ":", frameid[1])
-    !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", expanded_samp.state, expanded_samp.groupings, collect(1:length(expanded_samp.groupings)))
-    !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", expanded_samp.state, expanded_samp.groupings, collect(1:length(expanded_samp.groupings)))
-    !isnothing(path) && export_pdb(path, expanded_samp.state, expanded_samp.groupings, collect(1:length(expanded_samp.groupings)))
+    !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", expanded_samp.state, expanded_samp.groupings, collect(1:length(expanded_samp.groupings)); side_chain_decoder = side_chain_decoder)
+    !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", expanded_samp.state, expanded_samp.groupings, collect(1:length(expanded_samp.groupings)); side_chain_decoder = side_chain_decoder)
+    !isnothing(path) && export_pdb(path, expanded_samp.state, expanded_samp.groupings, collect(1:length(expanded_samp.groupings)); side_chain_decoder = side_chain_decoder)
     return samp
 end
 
@@ -353,17 +386,21 @@ Convert a sampled state into a `ProteinStructure`.
 - `resnums`: residue numbers for each residue.
 - `name`: protein name to use in the resulting structure.
 """
-function gen2prot(samp, chainids, resnums; name = "Gen", )
+function gen2prot(samp, chainids, resnums; name = "Gen", side_chain_decoder = nothing)
     d = Dict(zip(0:25,'A':'Z'))
     #@show chainids
     chain_letters = get.((d,), chainids[:], 'Z')
     #@show chain_letters
     locs = BranchChain.tensor(samp[1])[:,:,:,1] #nm
     rots = BranchChain.tensor(samp[2])[:,:,:,1]
-    global_ncac = BranchChain.Frames(rots, reshape(locs,3,:) .* 10)(BranchChain.ProteinChains.STANDARD_RESIDUE); #Angstroms?
-    global_atom11 = global_atom14(locs, rots, BranchChain.tensor(samp[4])[:,:,:,1]) #nm
-    at14 = cat(global_ncac ./ 10, global_atom11, dims = 2) #nm
-    struc = DLProteinFormats.unflatten(Atom14(), tensor(samp[3])[:], chain_letters, resnums[:], at14)
+    if isnothing(side_chain_decoder)
+        struc = DLProteinFormats.unflatten(tensor(samp[1]), tensor(samp[2]), tensor(samp[3]), chain_letters, resnums)[1]
+    else
+        global_ncac = BranchChain.Frames(rots, reshape(locs,3,:) .* 10)(BranchChain.ProteinChains.STANDARD_RESIDUE); #Angstroms?
+        global_atom11 = global_atom14(locs, rots, reshape(side_chain_decoder(BranchChain.tensor(samp[4])[:,:,1]), 3, 11, :)) #nm
+        at14 = cat(global_ncac ./ 10, global_atom11, dims = 2) #nm
+        struc = DLProteinFormats.unflatten(Atom14(), tensor(samp[3])[:], chain_letters, resnums[:], at14)
+    end
     #struc = DLProteinFormats.unflatten(tensor(samp[1]), tensor(samp[2]), tensor(samp[3]), chain_letters, resnums)[1]
     #ProteinStructure(name, Atom{eltype(tensor(samp[1]))}[], struc)
     return struc
@@ -377,7 +414,7 @@ Write a sampled state `samp` to a PDB file.
 Convenience wrapper around `ProteinChains.writepdb` that routes through
 `gen2prot`.
 """
-export_pdb(path, samp, chainids, resnums) = ProteinChains.writepdb(path, gen2prot(samp, chainids, resnums))
+export_pdb(path, samp, chainids, resnums; side_chain_decoder = nothing) = ProteinChains.writepdb(path, gen2prot(samp, chainids, resnums; side_chain_decoder = side_chain_decoder))
 
 step_sched(t) = Float32(1-(cos(t*pi)+1)/2)
 

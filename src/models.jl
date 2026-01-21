@@ -616,10 +616,123 @@ export BranchChainLS1
 
 
 
+
+#NOTE: THis model swaps the Xt init to be X1hat. Should reduce distance the frames need to travel. Will require more training to get into a good state.
+struct BranchChainLS2{L}
+    layers::L
+end
+Flux.@layer BranchChainLS2
+function BranchChainLS2(dim::Int = 384, depth::Int = 6, f_depth::Int = 6, sidechain_dim::Int = 256; config = nothing)
+    layers = (;
+        config = config, #Suggestion: make these so you can extract them with `eval(Meta.parse(model.layers.config.X))`
+        depth = depth,
+        f_depth = f_depth,
+        mask_embedder = Embedding(2 => dim),
+        break_embedder = Embedding(2 => dim),
+        t_rff = RandomFourierFeatures(1 => dim, 1f0),
+        cond_t_encoding = Dense(dim => dim, bias=false),
+        AApre_t_encoding = Dense(dim => dim, bias=false),
+        pair_rff = RandomFourierFeatures(2 => 64, 1f0),
+        pair_project = Dense(64 => 32, bias=false),
+        AA_embedder = Embedding(21 => dim),
+        selfcond_crossipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
+        selfcond_selfipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
+        ipa_blocks = [IPAblock(dim, IPA(IPA_settings(dim, c_z = 32)), ln1 = oldAdaLN(dim, dim), ln2 = oldAdaLN(dim, dim)) for _ in 1:depth],
+        framemovers = [Framemover(dim) for _ in 1:f_depth],
+        AAdecoder = Chain(StarGLU(dim, 3dim), Dense(dim => 21, bias=false)),
+        indelpre_t_encoding = Dense(dim => 3dim),
+        count_decoder = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        del_decoder   = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        feature_embedder = Dense(64 => dim),
+
+        main_to_sides = [Dense(dim => sidechain_dim) for _ in 1:depth],
+        sides_to_main = [Dense(sidechain_dim => dim) for _ in 1:depth],
+
+        side_chain_embedder = Dense(8 => sidechain_dim),
+        sc_side_chain_embedder = Dense(8 => sidechain_dim),
+        side_chain_cond = Dense(dim => sidechain_dim),
+        side_chain_rff = RandomFourierFeatures(8 => 2dim, 1f0),
+        side_chain_rff_embedder = Dense(2dim => sidechain_dim),
+        side_chain_decoder = Dense(sidechain_dim => 8),
+        #Principle: we want these IPA blocks to only care about the current side chains.
+        side_chain_ipa_blocks = [IPAblock(sidechain_dim, IPA(IPA_settings(sidechain_dim, c_z = 32)), ln1 = oldAdaLN(sidechain_dim, sidechain_dim), ln2 = oldAdaLN(sidechain_dim, sidechain_dim)) for _ in 1:depth],
+    )
+    return BranchChainLS2(layers)
+end
+function (fc::BranchChainLS2)(t, BSXt, chainids, resinds, breaks, chain_features; sc_frames = nothing)
+    l = fc.layers
+    Xt = BSXt.state
+    cmask = BSXt.flowmask
+
+    #Non-diff'd:
+    pmask = Flux.Zygote.@ignore self_att_padding_mask(BSXt.padmask)
+    pre_z = Flux.Zygote.@ignore l.pair_rff(pair_encode(resinds, chainids))
+    side_chain_locs = Flux.Zygote.@ignore tensor(Xt[4])
+    side_chain_rff = Flux.Zygote.@ignore l.side_chain_rff(side_chain_locs)
+    t_rff = Flux.Zygote.@ignore l.t_rff(t)
+
+    pair_feats = l.pair_project(pre_z)
+    cond = reshape(l.cond_t_encoding(t_rff), :, 1, size(t,2))
+
+    noise_frames = nothing
+    if isnothing(sc_frames)
+        frames = Translation(tensor(Xt[1])) ∘ Rotation(tensor(Xt[2]))
+    else
+        frames = sc_frames.frames
+        noise_frames = Translation(tensor(Xt[1])) ∘ Rotation(tensor(Xt[2]))
+    end
+
+    x = l.AA_embedder(tensor(Xt[3])) .+ 
+        l.mask_embedder(cmask .+ 1) .+ 
+        reshape(l.break_embedder(breaks .+ 1), :, 1, size(t,2)) .+ 
+        l.feature_embedder(chain_features .+ 0)
+        
+    #Side chains wind up as a linear projection of atom_x:
+    atom_x = l.side_chain_embedder(side_chain_locs) .+ l.side_chain_rff_embedder(side_chain_rff)
+    if !isnothing(sc_frames)
+        atom_x = atom_x + l.sc_side_chain_embedder(sc_frames.sidechains)
+    end
+    side_chain_cond = l.side_chain_cond(cond)
+
+    x_a,x_b,x_c = nothing, nothing, nothing
+    for i in 1:l.depth
+
+        #exchange info between tracks:
+        x = x + l.sides_to_main[i](atom_x)
+        atom_x = atom_x + l.main_to_sides[i](x)
+
+        if noise_frames !== nothing
+            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_selfipa[i], noise_frames, noise_frames, x, pair_feats, cond, pmask)
+            f1, f2 = mod(i, 2) == 0 ? (frames, noise_frames) : (noise_frames, frames)
+            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_crossipa[i], f1, f2, x, pair_feats, cond, pmask)
+        end
+        x = Flux.Zygote.checkpointed(ipa, l.ipa_blocks[i], frames, x, pair_feats, cond, pmask)
+        atom_x = Flux.Zygote.checkpointed(ipa, l.side_chain_ipa_blocks[i], frames, atom_x, pair_feats, side_chain_cond, pmask)
+        if i > l.depth - l.f_depth
+            frames = l.framemovers[i - l.depth + l.f_depth](frames, x, t = 1 .- (1 .- t .* 0.95f0).*cmask)
+        end
+        if i==4 (x_a = x) end
+        if i==5 (x_b = x) end
+        if i==6 (x_c = x) end
+    end
+    side_chain_locs = l.side_chain_decoder(atom_x)
+    aa_logits = l.AAdecoder(x .+ reshape(l.AApre_t_encoding(t_rff), :, 1, size(t,2)))
+    catted = vcat(x_a,x_b,x_c)
+    indel_pre_t = reshape(l.indelpre_t_encoding(t_rff), :, 1, size(t,2))
+    count_log = reshape(l.count_decoder(catted .+ indel_pre_t, false),  :, length(t))
+    del_logits = reshape(l.del_decoder(catted .+ indel_pre_t, false),  :, length(t))
+    return frames, aa_logits, side_chain_locs, count_log, del_logits
+end
+
+export BranchChainLS2
+
+
+
 P = CoalescentFlow((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), 
                      ManifoldProcess(OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0)), 
                      DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5)),
-                     OUBridgeExpVar(100f0, 50f0, 0.000000001f0, dec = -0.1f0), #Was first attempt with latents, but concerned it resolved too early
+                     #OUBridgeExpVar(100f0, 50f0, 0.000000001f0, dec = -0.1f0), #Was first attempt with latents, but concerned it resolved too early
+                     OUBridgeExpVar(50f0, 100f0, 0.000000001f0, dec = -0.1f0), #Should resolve a little later. Must not forget to swap back for the "longer" model run!
                      NullProcess()), 
                     Beta(1,2))
 

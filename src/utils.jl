@@ -181,6 +181,40 @@ function step_spec(model::Union{BranchChainLS1}, pdb_id, chain_labels, feature_f
     return mod_wrapper
 end
 
+function step_spec(model::Union{BranchChainLS2}, pdb_id, chain_labels, feature_func; hook = nothing, side_chain_decoder = nothing,
+    recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing, transform_array = [])
+    sc = nothing
+    function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)
+        !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", Xₜ.state, Xₜ.groupings, collect(1:length(Xₜ.groupings)); side_chain_decoder = side_chain_decoder)
+        Xtstate = Xₜ.state
+        frominds = Xtstate[5].S.state[:]
+        chain_features = broadcast_features([pdb_id], [chain_labels], Xₜ.groupings, (a,b) -> feature_func(a,b,override = feature_override))
+        if !isnothing(sc)
+            sc_frames = Translation(sc.frames.composed.outer.values[:,:,frominds,:]) ∘ Rotation(sc.frames.composed.inner.values[:,:,frominds,:])
+            sc_sidechains = sc.sidechains[:,frominds,:]
+            sc = (;frames = sc_frames, sidechains = sc_sidechains)
+        end
+        printseq && println(replace(DLProteinFormats.ints_to_aa(tensor(Xtstate[3])[:]), "X"=>"-"), ":", frameid[1])
+        if length(tensor(Xtstate[3])[:]) > 2000
+            error("Chain too long")
+        end
+        resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
+        input_bundle = ([t]', Xₜ, Xₜ.groupings, resinds, [true], chain_features) |> device
+        for _ in 1:recycles
+            sc_frames, _, sc_sidechains, _, _ = model(input_bundle..., sc_frames = device(sc))
+            sc = (;frames = sc_frames, sidechains = sc_sidechains)
+        end
+        pred = model(input_bundle..., sc_frames = device(sc)) |> cpu
+        sc_frames = deepcopy(pred[1])
+        state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(values(linear(pred[1])), dims=(3,4))), pred[2], ContinuousState(pred[3]), nothing
+        !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", (state_pred[1], state_pred[2], Xₜ.state[3], state_pred[4]), Xₜ.groupings, collect(1:length(Xₜ.groupings)); side_chain_decoder = side_chain_decoder)
+        !isnothing(hook) && hook(Xₜ.groupings, Xₜ.state, state_pred)
+        frameid[1] += 1
+        Xtstate[5].S.state .= 1:length(Xtstate[5].S.state) #<-Update the indexing state? Not being used.
+        return state_pred, pred[4], pred[5]
+    end
+    return mod_wrapper
+end
 
 #Alternative: Define "matched state" which holds on to a transform_array.
 #step will take the first part for some elements (eg. the discrete ones) but maintain the full state space for the others.

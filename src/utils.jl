@@ -182,6 +182,41 @@ function step_spec(model::Union{BranchChainLS1}, pdb_id, chain_labels, feature_f
 end
 
 
+function step_spec(model::Union{BranchChainLSNoseq}, pdb_id, chain_labels, feature_func; hook = nothing, side_chain_decoder = nothing,
+    recycles = 0, vidpath = nothing, printseq = true, device = identity, frameid = [1], feature_override = nothing, transform_array = [])
+    sc = nothing
+    function mod_wrapper(t, Xₜ; frameid = frameid, recycles = recycles)
+        !isnothing(vidpath) && export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", Xₜ.state, Xₜ.groupings, collect(1:length(Xₜ.groupings)); side_chain_decoder = side_chain_decoder)
+        Xtstate = Xₜ.state
+        frominds = Xtstate[5].S.state[:]
+        chain_features = broadcast_features([pdb_id], [chain_labels], Xₜ.groupings, (a,b) -> feature_func(a,b,override = feature_override))
+        if !isnothing(sc)
+            sc_frames = Translation(sc.frames.composed.outer.values[:,:,frominds,:]) ∘ Rotation(sc.frames.composed.inner.values[:,:,frominds,:])
+            sc_sidechains = sc.sidechains[:,frominds,:]
+            sc = (;frames = sc_frames, sidechains = sc_sidechains)
+        end
+        printseq && println(replace(DLProteinFormats.ints_to_aa(tensor(Xtstate[3])[:]), "X"=>"-"), ":", frameid[1])
+        if length(tensor(Xtstate[3])[:]) > 2000
+            error("Chain too long")
+        end
+        resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
+        input_bundle = ([t]', Xₜ, Xₜ.groupings, resinds, [true], chain_features) |> device
+        for _ in 1:recycles
+            sc_frames, _, sc_sidechains, _, _ = model(input_bundle..., sc_frames = device(sc))
+            sc = (;frames = sc_frames, sidechains = sc_sidechains)
+        end
+        pred = model(input_bundle..., sc_frames = device(sc)) |> cpu
+        sc_frames = deepcopy(pred[1])
+        state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(values(linear(pred[1])), dims=(3,4))), pred[2], ContinuousState(pred[3]), nothing
+        !isnothing(vidpath) && export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", (state_pred[1], state_pred[2], Xₜ.state[3], state_pred[4]), Xₜ.groupings, collect(1:length(Xₜ.groupings)); side_chain_decoder = side_chain_decoder)
+        !isnothing(hook) && hook(Xₜ.groupings, Xₜ.state, state_pred)
+        frameid[1] += 1
+        Xtstate[5].S.state .= 1:length(Xtstate[5].S.state) #<-Update the indexing state? Not being used.
+        return state_pred, pred[4], pred[5]
+    end
+    return mod_wrapper
+end
+
 #Alternative: Define "matched state" which holds on to a transform_array.
 #step will take the first part for some elements (eg. the discrete ones) but maintain the full state space for the others.
 #The symmetry will be enfoced at the "step" for the discrete components, but the "prediction" level for the continuous ones.
@@ -399,7 +434,8 @@ function gen2prot(samp, chainids, resnums; name = "Gen", side_chain_decoder = no
         global_ncac = BranchChain.Frames(rots, reshape(locs,3,:) .* 10)(BranchChain.ProteinChains.STANDARD_RESIDUE); #Angstroms?
         global_atom11 = global_atom14(locs, rots, reshape(side_chain_decoder(BranchChain.tensor(samp[4])[:,:,1]), 3, 11, :)) #nm
         at14 = cat(global_ncac ./ 10, global_atom11, dims = 2) #nm
-        struc = DLProteinFormats.unflatten(Atom14(), tensor(samp[3])[:], chain_letters, resnums[:], at14)
+        seq = DLProteinFormats.int_seq_from_at14(at14)
+        struc = DLProteinFormats.unflatten(Atom14(), seq, chain_letters, resnums[:], at14)
     end
     #struc = DLProteinFormats.unflatten(tensor(samp[1]), tensor(samp[2]), tensor(samp[3]), chain_letters, resnums)[1]
     #ProteinStructure(name, Atom{eltype(tensor(samp[1]))}[], struc)
@@ -439,7 +475,16 @@ export textlog, X1_modifier, training_prep, mod_wrapper, X1_from_pdb, design, lo
 local_atom14(locs, rots, atom14) = Inverse(Translation(locs) ∘ Rotation(rots))(atom14)
 global_atom14(locs, rots, atom14) = (Translation(locs) ∘ Rotation(rots))(atom14)
 
-export local_atom14, global_atom14
+
+function softclamp(loss)
+    if loss > 6
+        return 6 + log((loss - 6) + 1)
+    else
+        return loss
+    end
+end
+
+export local_atom14, global_atom14, softclamp
 
 #=
 rec = dat[1]

@@ -26,7 +26,7 @@ X0_mean_length = 0
 deletion_pad = 1.1
 per_chain_upper_X0_len = 1 + quantile(Poisson(X0_mean_length), 0.95)
 
-rundir = "runs/branchchain_latentsc_long_$(Date(now()))_$(rand(100000:999999))"
+rundir = "runs/branchchain_latentnoseq1_$(Date(now()))_$(rand(100000:999999))"
 mkpath("$(rundir)/samples")
 mkpath("$(rundir)/vids")
 
@@ -52,29 +52,34 @@ clusters = [get(pdb_clusters,c,0) for c in pdbid_clean.(dat.name)] #Zero fallbac
 #To prevent OOM, we now need to factor in that some low-t samples might have more elements than their X1 lengths:
 len_lbs = max.(length.(dat.AAs), length.(union.(dat.chainids)) .* per_chain_upper_X0_len) .* deletion_pad
 
-oldmodel = load_model("branchchain_feat64_30tune.jld");
-model = BranchChainLS1(merge(BranchChain.BranchChainLS1(384, 6, 6, 256).layers, oldmodel.layers)) |> device;
+#oldmodel = load_model("branchchain_feat64_30tune.jld");
+oldmodel = load_model("branchchain_feat64.jld");
+model = BranchChainLSNoseq(merge(BranchChain.BranchChainLSNoseq(384, 6, 6, 256).layers, oldmodel.layers)) |> device;
 
 #Minimal effect upon init:
 for l in model.layers.sides_to_main
-    l.weight ./= 50;
+    l.weight ./= 5;
 end
 for l in model.layers.main_to_sides
-    l.weight ./= 50;
+    l.weight ./= 5;
 end
-model.layers.side_chain_cond.weight ./= 50;
+model.layers.side_chain_cond.weight ./= 5;
 for l in model.layers.side_chain_ipa_blocks
-    l.ff.w2.weight ./= 50;
-    l.ipa.layers.ipa_linear.weight ./= 50;
+    l.ff.w2.weight ./= 6;
+    l.ipa.layers.ipa_linear.weight ./= 6;
 end
 for l in model.layers.side_chain_scframes_ipa_blocks
-    l.ff.w2.weight ./= 50;
-    l.ipa.layers.ipa_linear.weight ./= 50;
+    l.ff.w2.weight ./= 6;
+    l.ipa.layers.ipa_linear.weight ./= 6;
 end
 
 model.layers.side_chain_embedder.weight ./= 5;
 model.layers.side_chain_rff_embedder.weight ./= 5;
-model.layers.side_chain_decoder.weight ./= 10;
+model.layers.side_chain_decoder.weight ./= 5;
+model.layers.side_chain2x_embedder.weight ./= 5;
+model.layers.sc_side_chain_embedder.weight ./= 5;
+model.layers.sc_side_chain2x_embedder.weight ./= 5;
+model.layers.side_chain2x_rff_embedder.weight ./= 5;
 
 
 #=
@@ -120,7 +125,20 @@ ts = training_prep([1], dat, deletion_pad, X0_mean_length, train_ff, latent_side
 sc_frames = nothing
 ts.t
 frames, aa_logits, atom14, count_log, del_logit = model(ts.t', ts.Xt, ts.chainids, ts.resinds, ts.hasnobreaks, ts.chain_features, sc_frames = sc_frames)
+
+sc = nothing
+sc_frames, _, sc_sidechains, _, _ = model(ts.t', ts.Xt, ts.chainids, ts.resinds, ts.hasnobreaks, ts.chain_features, sc_frames = sc)
+sc = (;frames = sc_frames, sidechains = sc_sidechains)
+sc_frames, _, sc_sidechains, _, _ = model(ts.t', ts.Xt, ts.chainids, ts.resinds, ts.hasnobreaks, ts.chain_features, sc_frames = sc)
 =#
+
+for v in 1:3
+    sampname = "pretune_samp$(v)"    
+    vidpath = "$(rundir)/vids/$(sampname)"
+    feature_table[feature_table.pdb_id .== "7F5H",:]
+    template = compoundstate(merge(dat[172742], (;latent_sc = latent_side_chains[172742])), mask_override = dat[172742].chainids .== 2)
+    design(model, template[1], template[3], template[4], sampling_ff; steps = 250, recycles = 1, vidpath = vidpath, device = device, path = "$(rundir)/samples/$(sampname).pdb", side_chain_decoder = cpu_decoder)
+end
 
 starttime = now()
 textlog("$(rundir)/log.csv", ["epoch", "batch", "learning rate", "loss"])
@@ -130,16 +148,17 @@ for epoch in 1:10 #Test run
         #sched = linear_decay_schedule(sched.lr, 0.000000001f0, 2800)  #Single epoch
     end
     for (i, ts) in enumerate(batchloader(; device = device))
-        if (epoch == 1)  && (i == 10000)
+        if (epoch == 1)  && (i == 6000)
             Flux.thaw!(opt_state)
             sched = burnin_learning_schedule(0.00001f0, 0.00030f0, 1.05f0, 0.999995f0);
         end
         sc = nothing
-        for _ in 1:rand(Poisson(1))
+        sc_cycles = rand(Poisson(1))
+        for _ in 1:sc_cycles
             sc_frames, _, sc_sidechains, _, _ = model(ts.t', ts.Xt, ts.chainids, ts.resinds, ts.hasnobreaks, ts.chain_features, sc_frames = sc)
             sc = (;frames = sc_frames, sidechains = sc_sidechains)
         end
-        @show ts.t
+        @show sc_cycles, ts.t
         l, grad = Flux.withgradient(model) do m
             frames, aa_logits, atom14, count_log, del_logit = m(ts.t', ts.Xt, ts.chainids, ts.resinds, ts.hasnobreaks, ts.chain_features, sc_frames = sc)
             l_loc, l_rot, l_aas, l_atom14, l_splits, l_del = losses(BranchChain.P, (frames, aa_logits, atom14, count_log, del_logit), ts)
@@ -177,7 +196,7 @@ for v in 1:3
     vidpath = "$(rundir)/vids/$(sampname)"
     feature_table[feature_table.pdb_id .== "7F5H",:]
     template = compoundstate(merge(dat[172742], (;latent_sc = latent_side_chains[172742])), mask_override = dat[172742].chainids .== 2)
-    design(model, template[1], template[3], template[4], sampling_ff; steps = 1000, recycles = 2, vidpath = vidpath, device = device, path = "$(rundir)/samples/$(sampname).pdb", side_chain_decoder = cpu_decoder)
+    design(model, template[1], template[3], template[4], sampling_ff; steps = 200, recycles = 1, vidpath = vidpath, device = device, path = "$(rundir)/samples/$(sampname).pdb", side_chain_decoder = cpu_decoder)
 end
 
 #BranchChain.jldsave("$(rundir)/branchchain_AA.jld", model_state = cpu(model));

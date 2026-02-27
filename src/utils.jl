@@ -307,7 +307,17 @@ function design(model, X1, pdb_id, chain_labels, feature_func; transform_array =
     return samp
 end
 
-design(model, X1; kwargs...) = design(model, X1, "", [""], (x...; kwargs...) -> Dict(); kwargs...)
+_default_feature_dim(::BranchChainV1) = 1
+_default_feature_dim(model::BranchChainV2) = size(model.layers.feature_embedder.w1.weight, 2)
+_default_feature_dim(model::BranchChainV3) = size(model.layers.feature_embedder.weight, 2)
+_default_feature_dim(model) = 1
+
+function _default_feature_func(model)
+    dim = _default_feature_dim(model)
+    return (x...; kwargs...) -> falses(dim)
+end
+
+design(model, X1; kwargs...) = design(model, X1, "", [""], _default_feature_func(model); kwargs...)
 
 """
     gen2prot(samp, chainids, resnums; name="Gen")

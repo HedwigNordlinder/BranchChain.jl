@@ -11,5 +11,6 @@ include("models.jl")
 include("design_mask.jl")
 include("utils.jl")
 include("sym.jl")
+include("treegen.jl")
 
 end
